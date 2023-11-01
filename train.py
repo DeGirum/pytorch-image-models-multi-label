@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torchvision.utils
 import yaml
+import numpy as np
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm import utils
@@ -37,6 +38,10 @@ from timm.models import create_model, safe_model_name, resume_checkpoint, load_c
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
+from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
+
+from torchvision import transforms
+from torchvision.datasets import CelebA
 
 try:
     from apex import amp
@@ -67,7 +72,6 @@ except ImportError as e:
 
 has_compile = hasattr(torch, 'compile')
 
-
 _logger = logging.getLogger('train')
 
 # The first arg parser parses out only the --config argument, this argument is used to
@@ -84,7 +88,7 @@ group = parser.add_argument_group('Dataset parameters')
 # Keep this argument outside the dataset group because it is positional.
 parser.add_argument('data', nargs='?', metavar='DIR', const=None,
                     help='path to dataset (positional is *deprecated*, use --data-dir)')
-parser.add_argument('--data-dir', metavar='DIR',
+parser.add_argument('--data-dir', metavar='DIR', default='/data/ml-data/',
                     help='path to dataset (root dir)')
 parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
@@ -96,10 +100,19 @@ group.add_argument('--dataset-download', action='store_true', default=False,
                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
+group.add_argument(
+        "--val-resize-size", default=256, type=int, help="the resize size used for validation (default: 256)"
+    )
+group.add_argument(
+    "--val-crop-size", default=224, type=int, help="the central crop size used for validation (default: 224)"
+)
+group.add_argument(
+    "--train-crop-size", default=224, type=int, help="the random crop size used for training (default: 224)"
+)
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
-group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
+group.add_argument('--model', default='resnet18', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
 group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
@@ -128,7 +141,7 @@ group.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
                    help='Override std deviation of dataset')
 group.add_argument('--interpolation', default='', type=str, metavar='NAME',
                    help='Image resize interpolation type (overrides model)')
-group.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
+group.add_argument('-b', '--batch-size', type=int, default=64, metavar='N',
                    help='Input batch size for training (default: 128)')
 group.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                    help='Validation batch size override (default: None)')
@@ -157,7 +170,7 @@ scripting_group.add_argument('--torchcompile', nargs='?', type=str, default=None
 
 # Optimizer parameters
 group = parser.add_argument_group('Optimizer parameters')
-group.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
+group.add_argument('--opt', default='adam', type=str, metavar='OPTIMIZER',
                    help='Optimizer (default: "sgd")')
 group.add_argument('--opt-eps', default=None, type=float, metavar='EPSILON',
                    help='Optimizer Epsilon (default: None, use opt default)')
@@ -207,7 +220,7 @@ group.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
                    help='warmup learning rate (default: 1e-5)')
 group.add_argument('--min-lr', type=float, default=0, metavar='LR',
                    help='lower lr bound for cyclic schedulers that hit 0 (default: 0)')
-group.add_argument('--epochs', type=int, default=300, metavar='N',
+group.add_argument('--epochs', type=int, default=2, metavar='N',
                    help='number of epochs to train (default: 300)')
 group.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
                    help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
@@ -323,7 +336,7 @@ group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
 group.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
                    help='number of checkpoints to keep (default: 10)')
-group.add_argument('-j', '--workers', type=int, default=4, metavar='N',
+group.add_argument('-j', '--workers', type=int, default=2, metavar='N',
                    help='how many training processes to use (default: 4)')
 group.add_argument('--save-images', action='store_true', default=False,
                    help='save images of input bathes every log interval for debugging')
@@ -345,8 +358,8 @@ group.add_argument('--output', default='', type=str, metavar='PATH',
                    help='path to output folder (default: none, current dir)')
 group.add_argument('--experiment', default='', type=str, metavar='NAME',
                    help='name of train experiment, name of sub-folder for output')
-group.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
-                   help='Best metric (default: "top1"')
+group.add_argument('--eval-metric', default='average_f1_score', type=str, metavar='EVAL_METRIC',
+                   help='Best metric (default: "average_f1_score"')
 group.add_argument('--tta', type=int, default=0, metavar='N',
                    help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
 group.add_argument("--local_rank", default=0, type=int)
@@ -578,27 +591,6 @@ def main():
     # create the train and eval datasets
     if args.data and not args.data_dir:
         args.data_dir = args.data
-    dataset_train = create_dataset(
-        args.dataset,
-        root=args.data_dir,
-        split=args.train_split,
-        is_training=True,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        repeats=args.epoch_repeats,
-    )
-
-    dataset_eval = create_dataset(
-        args.dataset,
-        root=args.data_dir,
-        split=args.val_split,
-        is_training=False,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size,
-    )
 
     # setup mixup / cutmix
     collate_fn = None
@@ -625,10 +617,44 @@ def main():
     if num_aug_splits > 1:
         dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
 
+
     # create data loaders w/ augmentation pipeiine
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
+
+
+    # loading celeba dataset
+    def load_data(root_dir):
+        
+        print (root_dir)
+        print("Loading data")
+        val_resize_size, val_crop_size, train_crop_size = (
+            args.val_resize_size,
+            args.val_crop_size,
+            args.train_crop_size,
+        )
+
+
+        train_transform = transforms.Compose([
+                transforms.CenterCrop(args.train_crop_size)
+            ])
+        
+        val_transform = transforms.Compose([
+                transforms.Resize(val_resize_size),  # Resize the images to a specific size
+                transforms.CenterCrop(val_crop_size),  # Crop the center portion of the image
+                transforms.ToTensor(),  # Convert images to tensors
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the pixel values
+            ])
+
+        celeba_train_dataset = CelebA(root=root_dir, split='train', transform=train_transform, download=False)
+        celeba_test_dataset = CelebA(root=root_dir, split='valid', transform=val_transform, download=False)
+
+        print (celeba_train_dataset,celeba_test_dataset)
+        return celeba_train_dataset,celeba_test_dataset
+
+    dataset_train, dataset_test= load_data(args.data_dir)
+
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -664,8 +690,10 @@ def main():
     if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
         # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
         eval_workers = min(2, args.workers)
+
+
     loader_eval = create_loader(
-        dataset_eval,
+        dataset_test,
         input_size=data_config['input_size'],
         batch_size=args.validation_batch_size or args.batch_size,
         is_training=False,
@@ -679,7 +707,7 @@ def main():
         pin_memory=args.pin_mem,
         device=device,
     )
-
+    print (loader_train,loader_eval)
     # setup loss function
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -698,7 +726,8 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.to(device=device)
-    validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
+    # validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
+    validate_loss_fn = nn.BCEWithLogitsLoss()
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -900,7 +929,7 @@ def train_one_epoch(
         def _forward():
             with amp_autocast():
                 output = model(input)
-                loss = loss_fn(output, target)
+                loss = loss_fn(output, target.float())
             if accum_steps > 1:
                 loss /= accum_steps
             return loss
@@ -1010,9 +1039,12 @@ def validate(
 ):
     batch_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
-    top1_m = utils.AverageMeter()
-    top5_m = utils.AverageMeter()
+    accuracy = utils.AverageMeter()
+    # top5_m = utils.AverageMeter()
 
+    y_true = []  # True labels
+    y_pred = []  # Predicted labels
+    losses = []
     model.eval()
 
     end = time.time()
@@ -1022,7 +1054,7 @@ def validate(
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
                 input = input.to(device)
-                target = target.to(device)
+                target = target.float().to(device)
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
@@ -1037,13 +1069,20 @@ def validate(
                     output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                     target = target[0:target.size(0):reduce_factor]
 
-                loss = loss_fn(output, target)
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+                loss = loss_fn(output, target.float())
+                # Convert predictions and true labels to numpy arrays
+                output_np = output.sigmoid().cpu().numpy()  # Sigmoid for multi-label classification
+                target_np = target.cpu().numpy()
+                y_pred.append(output_np)
+                y_true.append(target_np)
+                losses.append(loss.item())
+
+            # acc = utils.multi_label_accuracy(output, target)
 
             if args.distributed:
                 reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
-                acc1 = utils.reduce_tensor(acc1, args.world_size)
-                acc5 = utils.reduce_tensor(acc5, args.world_size)
+                # acc = utils.reduce_tensor(acc, args.world_size)
+                # acc5 = utils.reduce_tensor(acc5, args.world_size)
             else:
                 reduced_loss = loss.data
 
@@ -1051,8 +1090,8 @@ def validate(
                 torch.cuda.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
+            # accuracy.update(acc.item(), output.size(0))
+            # top5_m.update(acc5.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -1062,11 +1101,23 @@ def validate(
                     f'{log_name}: [{batch_idx:>4d}/{last_idx}]  '
                     f'Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})  '
                     f'Loss: {losses_m.val:>7.3f} ({losses_m.avg:>6.3f})  '
-                    f'Acc@1: {top1_m.val:>7.3f} ({top1_m.avg:>7.3f})  '
-                    f'Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})'
+                    # f'Acc: {accuracy.val:>7.3f} ({accuracy.avg:>7.3f})  '
+                    # f'Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})'
                 )
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+
+    y_pred = np.concatenate(y_pred, axis=0)
+    y_true = np.concatenate(y_true, axis=0)
+
+    # Calculate evaluation metrics
+    # average_loss = np.mean(losses)
+    f1 = f1_score(y_true, (y_pred > 0.5).astype(int), average="samples")
+    precision = precision_score(y_true, (y_pred > 0.5).astype(int), average="samples")
+    recall = recall_score(y_true, (y_pred > 0.5).astype(int), average="samples")
+
+    
+    metrics = OrderedDict([('loss', losses_m.avg), ('average_f1_score', f1), ('precision', precision),('recall', recall)])
+    print (metrics)
 
     return metrics
 
