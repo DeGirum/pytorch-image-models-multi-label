@@ -33,7 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
-from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy
+from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, FocalLoss
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
@@ -629,13 +629,14 @@ def main():
         
         print (root_dir)
         print("Loading data")
+       
         val_resize_size, val_crop_size, train_crop_size = (
             args.val_resize_size,
             args.val_crop_size,
             args.train_crop_size,
         )
 
-
+        print (val_resize_size, val_crop_size, train_crop_size)
         train_transform = transforms.Compose([
                 transforms.CenterCrop(args.train_crop_size)
             ])
@@ -646,6 +647,8 @@ def main():
                 transforms.ToTensor(),  # Convert images to tensors
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the pixel values
             ])
+
+
 
         celeba_train_dataset = CelebA(root=root_dir, split='train', transform=train_transform, download=False)
         celeba_test_dataset = CelebA(root=root_dir, split='valid', transform=val_transform, download=False)
@@ -707,28 +710,40 @@ def main():
         pin_memory=args.pin_mem,
         device=device,
     )
-    print (loader_train,loader_eval)
-    # setup loss function
-    if args.jsd_loss:
-        assert num_aug_splits > 1  # JSD only valid with aug splits set
-        train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
-    elif mixup_active:
-        # smoothing is handled with mixup target transform which outputs sparse, soft targets
-        if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
-        else:
-            train_loss_fn = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(smoothing=args.smoothing, target_threshold=args.bce_target_thresh)
-        else:
-            train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        train_loss_fn = nn.CrossEntropyLoss()
-    train_loss_fn = train_loss_fn.to(device=device)
-    # validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
-    validate_loss_fn = nn.BCEWithLogitsLoss()
 
+
+
+    # print (args.distributed,args.pin_mem,device,args.batch_size)
+    # print ("eval config------------",data_config['input_size'],data_config['interpolation'],data_config['mean'],data_config['std'],data_config['crop_pct'])
+    # print ("----------------------------",loader_train,loader_eval)
+
+
+    # model.eval()
+
+    # with torch.no_grad():
+    #     end = time.time()
+    #     for i, (input, target) in enumerate(loader_eval):
+    #         print (input.shape,target.shape)
+    # setup loss function
+    # if args.jsd_loss:
+    #     assert num_aug_splits > 1  # JSD only valid with aug splits set
+    #     train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
+    # elif mixup_active:
+    #     # smoothing is handled with mixup target transform which outputs sparse, soft targets
+    #     if args.bce_loss:
+    #         train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
+    #     else:
+    #         train_loss_fn = SoftTargetCrossEntropy()
+    # elif args.smoothing:
+    #     if args.bce_loss:
+    #         train_loss_fn = BinaryCrossEntropy(smoothing=args.smoothing, target_threshold=args.bce_target_thresh)
+    #     else:
+    #         train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    # else:
+    #     train_loss_fn = nn.CrossEntropyLoss()
+    train_loss_fn = FocalLoss()
+    # validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
+    validate_loss_fn = FocalLoss()
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
     best_metric = None
@@ -1045,6 +1060,7 @@ def validate(
     y_true = []  # True labels
     y_pred = []  # Predicted labels
     losses = []
+    accuracies = []
     model.eval()
 
     end = time.time()
@@ -1070,13 +1086,33 @@ def validate(
                     target = target[0:target.size(0):reduce_factor]
 
                 loss = loss_fn(output, target.float())
+                predictions = (output > 0.5).float()
+                correct = (predictions == target).sum(dim=0).float()
+                total = target.size(0)
+    
+                # Calculate accuracy as the average accuracy across all labels
+                accuracy = (correct / total) * 100.0
+                # print ("accuracy list--------------------",accuracy)
+                accuracies.append(accuracy)
+                
+                
                 # Convert predictions and true labels to numpy arrays
                 output_np = output.sigmoid().cpu().numpy()  # Sigmoid for multi-label classification
                 target_np = target.cpu().numpy()
+                # predictions = (output_np > 0.5)
+                # print ("predictions===========",predictions,predictions.shape)
+                # print ("target--------------",target,target.shape)
+                # Calculate accuracy for each label separately
+                # correct = (predictions == target_np).sum(dim=0).float()
+                # print ("correct------------",correct,correct.shape)
+                # total = target.size(0)
+    
+                # Calculate accuracy as the average accuracy across all labels
+                # accuracy = (correct / total) * 100.0
                 y_pred.append(output_np)
                 y_true.append(target_np)
-                losses.append(loss.item())
-
+                # losses.append(loss.item())
+                
             # acc = utils.multi_label_accuracy(output, target)
 
             if args.distributed:
@@ -1105,18 +1141,28 @@ def validate(
                     # f'Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})'
                 )
 
-
+        stacked_tensor = torch.stack(accuracies)
+        avg_accuracy = torch.mean(stacked_tensor, dim=0)
+        # print (avg_accuracy)
+       
     y_pred = np.concatenate(y_pred, axis=0)
     y_true = np.concatenate(y_true, axis=0)
+    
 
+    # Compute the mean along the desired dimension (0 for index positions)
+    
+    # avg_accuracy = np.mean(accuracies, axis=0)
     # Calculate evaluation metrics
     # average_loss = np.mean(losses)
     f1 = f1_score(y_true, (y_pred > 0.5).astype(int), average="samples")
     precision = precision_score(y_true, (y_pred > 0.5).astype(int), average="samples")
     recall = recall_score(y_true, (y_pred > 0.5).astype(int), average="samples")
 
-    
-    metrics = OrderedDict([('loss', losses_m.avg), ('average_f1_score', f1), ('precision', precision),('recall', recall)])
+    # print (avg_accuracy)
+    attribute_name=["5 o’clock Shadow",	"Arched Eyebrows",	"Attractive",	"Bags Under Eyes",	"Bald",	"Bangs",	"Big Lips",	"Big Nose",	"Black Hair",	"Blond Hair",	"Blurry",	"Brown Hair",	"Bushy Eyebrows",	"Chubby",	"Double Chin",	"Eyeglasses",	"Goatee",	"Gray Hair",	"Heavy Makeup",	"High cheekbones",	"Male",	"Mouth Slightly Open",	"Mustache",	"Narrow Eyes",	"No Beard",	"Oval Face",	"Pale Skin",	"Pointy Nose",	"Receding Hairline",	"Rosy Cheeks",	"Sideburns",	"Smiling",	"Straight Hair",	"Wavy Hair",	"Wearing Earrings",	"Wearing Hat",	"Wearing Lipstick",	"Wearing Necklace",	"Wearing Necktie",	"Young"]
+    for index in range(len(attribute_name)):
+        print(attribute_name[index],"\t",avg_accuracy[index].item())
+    metrics = OrderedDict([('loss', losses_m.avg),('average_f1_score', f1), ('precision', precision),('recall', recall)])
     print (metrics)
 
     return metrics
