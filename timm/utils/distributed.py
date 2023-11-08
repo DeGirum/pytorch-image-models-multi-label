@@ -83,7 +83,7 @@ def init_distributed_device(args):
     args.distributed = False
     args.world_size = 1
     args.rank = 0  # global rank
-    args.local_rank = 0
+    # args.local_rank = 0
 
     # TBD, support horovod?
     # if args.horovod:
@@ -127,7 +127,7 @@ def init_distributed_device(args):
         if args.distributed:
             device = 'cuda:%d' % args.local_rank
         else:
-            device = 'cuda:0'
+            device = 'cuda:%d' % args.local_rank
         torch.cuda.set_device(device)
     else:
         device = 'cpu'

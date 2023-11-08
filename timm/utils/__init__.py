@@ -7,7 +7,7 @@ from .distributed import distribute_bn, reduce_tensor, init_distributed_device,\
     world_info_from_env, is_distributed_env, is_primary
 from .jit import set_jit_legacy, set_jit_fuser
 from .log import setup_default_logging, FormatterNoInfo
-from .metrics import AverageMeter, accuracy
+from .metrics import AverageMeter, accuracy, accuracy_multi_label
 from .misc import natural_key, add_bool_arg, ParseKwargs
 from .model import unwrap_model, get_state_dict, freeze, unfreeze, reparameterize_model
 from .model_ema import ModelEma, ModelEmaV2

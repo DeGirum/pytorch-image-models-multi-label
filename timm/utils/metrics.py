@@ -22,6 +22,13 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
+def accuracy_multi_label(output, target):
+    """Computes the accuracy_multi_label over the k top predictions for the specified values of k"""
+    batch_size = target.size(0)
+    pred = (output > 0).float()
+    correct = pred.eq(target)
+    return correct.float().sum(0) * 100. / batch_size
+
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     maxk = min(max(topk), output.size()[1])

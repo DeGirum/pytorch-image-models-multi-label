@@ -1,37 +1,26 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class FocalLoss(nn.Module):
-    "Non weighted version of Focal Loss"
-    def __init__(self, alpha=.25, gamma=2):
-        super(FocalLoss, self).__init__()
-        # self.alpha = torch.tensor([alpha, 1-alpha]).cuda()
-        self.alpha = alpha
-        self.gamma = gamma
+    """Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)."""
 
-    def forward(self, input, target):
-        # print ("initial input size----------------",input.size(0),input.size(1), input.dim())
-        # if input.dim()>2:
-        #     input = input.view(input.size(0),input.size(1),-1)  # N,C,H,W => N,C,H*W
-        #     print ("--------------------",input.size)
-        #     input = input.transpose(1,2)    # N,C,H*W => N,H*W,C
-        #     print ("after transpose-------------",input.size)
-        #     input = input.contiguous().view(-1,input.size(2))   # N,H*W,C => N*H*W,C
-        #     print ("input final shape ------------------",input.size)
-        # target = target.view(-1,1)
+    def __init__(self, ):
+        """Initializer for FocalLoss class with no parameters."""
+        super().__init__()
 
-        BCE_loss = F.binary_cross_entropy_with_logits(input, target, reduction='none')
-        # targets = targets.double()
-        target = target.to(torch.int64)
-        # if self.alpha is not None:
-        #     if self.alpha.type()!=input.data.type():
-        #         self.alpha = self.alpha.type_as(input.data)
-        #     at = self.alpha.gather(0,target.data)
+    @staticmethod
+    def forward(pred, label, gamma=1.5, alpha=0.25):
+        """Calculates and updates confusion matrix for object detection/classification tasks."""
+        loss = F.binary_cross_entropy_with_logits(pred, label, reduction='none')
+        # p_t = torch.exp(-loss)
+        # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
 
-        at = self.alpha*target + (1-self.alpha)*(1-target) 
-
-        # at = self.alpha.gather(0, target.view(-1))
-        pt = torch.exp(-BCE_loss)
-        F_loss = at*(1-pt)**self.gamma * BCE_loss
-        return F_loss.mean()
+        # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
+        pred_prob = pred.sigmoid()  # prob from logits
+        p_t = label * pred_prob + (1 - label) * (1 - pred_prob)
+        modulating_factor = (1.0 - p_t) ** gamma
+        loss *= modulating_factor
+        if alpha > 0:
+            alpha_factor = label * alpha + (1 - label) * (1 - alpha)
+            loss *= alpha_factor
+        return loss.mean(1).sum()

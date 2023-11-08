@@ -27,7 +27,6 @@ import torch
 import torch.nn as nn
 import torchvision.utils
 import yaml
-import numpy as np
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm import utils
@@ -38,10 +37,6 @@ from timm.models import create_model, safe_model_name, resume_checkpoint, load_c
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
-from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
-
-from torchvision import transforms
-from torchvision.datasets import CelebA
 
 try:
     from apex import amp
@@ -100,15 +95,6 @@ group.add_argument('--dataset-download', action='store_true', default=False,
                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
-group.add_argument(
-        "--val-resize-size", default=256, type=int, help="the resize size used for validation (default: 256)"
-    )
-group.add_argument(
-    "--val-crop-size", default=224, type=int, help="the central crop size used for validation (default: 224)"
-)
-group.add_argument(
-    "--train-crop-size", default=224, type=int, help="the random crop size used for training (default: 224)"
-)
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
@@ -141,7 +127,7 @@ group.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
                    help='Override std deviation of dataset')
 group.add_argument('--interpolation', default='', type=str, metavar='NAME',
                    help='Image resize interpolation type (overrides model)')
-group.add_argument('-b', '--batch-size', type=int, default=64, metavar='N',
+group.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
                    help='Input batch size for training (default: 128)')
 group.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                    help='Validation batch size override (default: None)')
@@ -170,7 +156,7 @@ scripting_group.add_argument('--torchcompile', nargs='?', type=str, default=None
 
 # Optimizer parameters
 group = parser.add_argument_group('Optimizer parameters')
-group.add_argument('--opt', default='adam', type=str, metavar='OPTIMIZER',
+group.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
                    help='Optimizer (default: "sgd")')
 group.add_argument('--opt-eps', default=None, type=float, metavar='EPSILON',
                    help='Optimizer Epsilon (default: None, use opt default)')
@@ -218,9 +204,9 @@ group.add_argument('--lr-k-decay', type=float, default=1.0,
                    help='learning rate k-decay for cosine/poly (default: 1.0)')
 group.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
                    help='warmup learning rate (default: 1e-5)')
-group.add_argument('--min-lr', type=float, default=0, metavar='LR',
+group.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
                    help='lower lr bound for cyclic schedulers that hit 0 (default: 0)')
-group.add_argument('--epochs', type=int, default=2, metavar='N',
+group.add_argument('--epochs', type=int, default=300, metavar='N',
                    help='number of epochs to train (default: 300)')
 group.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
                    help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
@@ -358,8 +344,8 @@ group.add_argument('--output', default='', type=str, metavar='PATH',
                    help='path to output folder (default: none, current dir)')
 group.add_argument('--experiment', default='', type=str, metavar='NAME',
                    help='name of train experiment, name of sub-folder for output')
-group.add_argument('--eval-metric', default='average_f1_score', type=str, metavar='EVAL_METRIC',
-                   help='Best metric (default: "average_f1_score"')
+group.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
+                   help='Best metric (default: "top1"')
 group.add_argument('--tta', type=int, default=0, metavar='N',
                    help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
 group.add_argument("--local_rank", default=0, type=int)
@@ -592,6 +578,10 @@ def main():
     if args.data and not args.data_dir:
         args.data_dir = args.data
 
+    from torchvision.datasets import CelebA
+    dataset_train = CelebA(root=args.data_dir, split='train')
+    dataset_eval = CelebA(root=args.data_dir, split='valid')
+
     # setup mixup / cutmix
     collate_fn = None
     mixup_fn = None
@@ -617,47 +607,10 @@ def main():
     if num_aug_splits > 1:
         dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
 
-
     # create data loaders w/ augmentation pipeiine
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
-
-
-    # loading celeba dataset
-    def load_data(root_dir):
-        
-        print (root_dir)
-        print("Loading data")
-       
-        val_resize_size, val_crop_size, train_crop_size = (
-            args.val_resize_size,
-            args.val_crop_size,
-            args.train_crop_size,
-        )
-
-        print (val_resize_size, val_crop_size, train_crop_size)
-        train_transform = transforms.Compose([
-                transforms.CenterCrop(args.train_crop_size)
-            ])
-        
-        val_transform = transforms.Compose([
-                transforms.Resize(val_resize_size),  # Resize the images to a specific size
-                transforms.CenterCrop(val_crop_size),  # Crop the center portion of the image
-                transforms.ToTensor(),  # Convert images to tensors
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize the pixel values
-            ])
-
-
-
-        celeba_train_dataset = CelebA(root=root_dir, split='train', transform=train_transform, download=False)
-        celeba_test_dataset = CelebA(root=root_dir, split='valid', transform=val_transform, download=False)
-
-        print (celeba_train_dataset,celeba_test_dataset)
-        return celeba_train_dataset,celeba_test_dataset
-
-    dataset_train, dataset_test= load_data(args.data_dir)
-
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -693,10 +646,8 @@ def main():
     if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
         # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
         eval_workers = min(2, args.workers)
-
-
     loader_eval = create_loader(
-        dataset_test,
+        dataset_eval,
         input_size=data_config['input_size'],
         batch_size=args.validation_batch_size or args.batch_size,
         is_training=False,
@@ -711,19 +662,6 @@ def main():
         device=device,
     )
 
-
-
-    # print (args.distributed,args.pin_mem,device,args.batch_size)
-    # print ("eval config------------",data_config['input_size'],data_config['interpolation'],data_config['mean'],data_config['std'],data_config['crop_pct'])
-    # print ("----------------------------",loader_train,loader_eval)
-
-
-    # model.eval()
-
-    # with torch.no_grad():
-    #     end = time.time()
-    #     for i, (input, target) in enumerate(loader_eval):
-    #         print (input.shape,target.shape)
     # setup loss function
     # if args.jsd_loss:
     #     assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -740,10 +678,11 @@ def main():
     #     else:
     #         train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     # else:
-    #     train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = FocalLoss()
-    # validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
     validate_loss_fn = FocalLoss()
+    train_loss_fn = train_loss_fn.to(device=device)
+    validate_loss_fn = validate_loss_fn.to(device=device)
+
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
     best_metric = None
@@ -1054,13 +993,10 @@ def validate(
 ):
     batch_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
-    accuracy = utils.AverageMeter()
+    top1_m = utils.AverageMeter()
+    top1_m_per_class = [utils.AverageMeter() for _ in range(args.num_classes)]
     # top5_m = utils.AverageMeter()
 
-    y_true = []  # True labels
-    y_pred = []  # Predicted labels
-    losses = []
-    accuracies = []
     model.eval()
 
     end = time.time()
@@ -1086,38 +1022,14 @@ def validate(
                     target = target[0:target.size(0):reduce_factor]
 
                 loss = loss_fn(output, target.float())
-                predictions = (output > 0.5).float()
-                correct = (predictions == target).sum(dim=0).float()
-                total = target.size(0)
-    
-                # Calculate accuracy as the average accuracy across all labels
-                accuracy = (correct / total) * 100.0
-                # print ("accuracy list--------------------",accuracy)
-                accuracies.append(accuracy)
-                
-                
-                # Convert predictions and true labels to numpy arrays
-                output_np = output.sigmoid().cpu().numpy()  # Sigmoid for multi-label classification
-                target_np = target.cpu().numpy()
-                # predictions = (output_np > 0.5)
-                # print ("predictions===========",predictions,predictions.shape)
-                # print ("target--------------",target,target.shape)
-                # Calculate accuracy for each label separately
-                # correct = (predictions == target_np).sum(dim=0).float()
-                # print ("correct------------",correct,correct.shape)
-                # total = target.size(0)
-    
-                # Calculate accuracy as the average accuracy across all labels
-                # accuracy = (correct / total) * 100.0
-                y_pred.append(output_np)
-                y_true.append(target_np)
-                # losses.append(loss.item())
-                
-            # acc = utils.multi_label_accuracy(output, target)
+            acc1_all = utils.accuracy_multi_label(output, target)
+            acc1 = acc1_all.mean()
 
             if args.distributed:
                 reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
-                # acc = utils.reduce_tensor(acc, args.world_size)
+                acc1 = utils.reduce_tensor(acc1, args.world_size)
+                for acc1_pc in acc1_all:
+                    acc1_pc = utils.reduce_tensor(acc1_pc, args.world_size)
                 # acc5 = utils.reduce_tensor(acc5, args.world_size)
             else:
                 reduced_loss = loss.data
@@ -1126,7 +1038,9 @@ def validate(
                 torch.cuda.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
-            # accuracy.update(acc.item(), output.size(0))
+            top1_m.update(acc1.item(), output.size(0))
+            for i, top1_m_pc in enumerate(top1_m_per_class):
+                top1_m_pc.update(acc1_all[i].item(), output.size(0))
             # top5_m.update(acc5.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
@@ -1137,33 +1051,18 @@ def validate(
                     f'{log_name}: [{batch_idx:>4d}/{last_idx}]  '
                     f'Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})  '
                     f'Loss: {losses_m.val:>7.3f} ({losses_m.avg:>6.3f})  '
-                    # f'Acc: {accuracy.val:>7.3f} ({accuracy.avg:>7.3f})  '
+                    f'Acc@1: {top1_m.val:>7.3f} ({top1_m.avg:>7.3f})  '
                     # f'Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})'
                 )
+                
+        attribute_name = ["5 o’clock Shadow",	"Arched Eyebrows",	"Attractive",	"Bags Under Eyes",	"Bald",	"Bangs",	"Big Lips",	"Big Nose",	"Black Hair",	"Blond Hair",	"Blurry",	"Brown Hair",	"Bushy Eyebrows",	"Chubby",	"Double Chin",	"Eyeglasses",	"Goatee",	"Gray Hair",	"Heavy Makeup",	"High cheekbones",	"Male",	"Mouth Slightly Open",	"Mustache",	"Narrow Eyes",	"No Beard",	"Oval Face",	"Pale Skin",	"Pointy Nose",	"Receding Hairline",	"Rosy Cheeks",	"Sideburns",	"Smiling",	"Straight Hair",	"Wavy Hair",	"Wearing Earrings",	"Wearing Hat",	"Wearing Lipstick",	"Wearing Necklace",	"Wearing Necktie",	"Young"]
+        for i, top1_m_pc in enumerate(top1_m_per_class): 
+            _logger.info(f'{attribute_name[i]:>25}:\t\t Acc@1: {top1_m_pc.avg:>7.3f}')
 
-        stacked_tensor = torch.stack(accuracies)
-        avg_accuracy = torch.mean(stacked_tensor, dim=0)
-        # print (avg_accuracy)
-       
-    y_pred = np.concatenate(y_pred, axis=0)
-    y_true = np.concatenate(y_true, axis=0)
-    
 
-    # Compute the mean along the desired dimension (0 for index positions)
-    
-    # avg_accuracy = np.mean(accuracies, axis=0)
-    # Calculate evaluation metrics
-    # average_loss = np.mean(losses)
-    f1 = f1_score(y_true, (y_pred > 0.5).astype(int), average="samples")
-    precision = precision_score(y_true, (y_pred > 0.5).astype(int), average="samples")
-    recall = recall_score(y_true, (y_pred > 0.5).astype(int), average="samples")
 
-    # print (avg_accuracy)
-    attribute_name=["5 o’clock Shadow",	"Arched Eyebrows",	"Attractive",	"Bags Under Eyes",	"Bald",	"Bangs",	"Big Lips",	"Big Nose",	"Black Hair",	"Blond Hair",	"Blurry",	"Brown Hair",	"Bushy Eyebrows",	"Chubby",	"Double Chin",	"Eyeglasses",	"Goatee",	"Gray Hair",	"Heavy Makeup",	"High cheekbones",	"Male",	"Mouth Slightly Open",	"Mustache",	"Narrow Eyes",	"No Beard",	"Oval Face",	"Pale Skin",	"Pointy Nose",	"Receding Hairline",	"Rosy Cheeks",	"Sideburns",	"Smiling",	"Straight Hair",	"Wavy Hair",	"Wearing Earrings",	"Wearing Hat",	"Wearing Lipstick",	"Wearing Necklace",	"Wearing Necktie",	"Young"]
-    for index in range(len(attribute_name)):
-        print(attribute_name[index],"\t",avg_accuracy[index].item())
-    metrics = OrderedDict([('loss', losses_m.avg),('average_f1_score', f1), ('precision', precision),('recall', recall)])
-    print (metrics)
+
+    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg)])
 
     return metrics
 
