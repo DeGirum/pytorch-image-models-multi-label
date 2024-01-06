@@ -14,7 +14,89 @@ except ImportError:
 from PIL import Image
 import numpy as np
 
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
+class RandomCLAHE:
+    def __init__(self, p=0.1, clip_limit=2.0, tile_grid_size=(8, 8)):
+        self.p = p
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+
+    def __call__(self, pil_img):
+        if random.random() < self.p:
+            aug = A.CLAHE(clip_limit=self.clip_limit, tile_grid_size=self.tile_grid_size, always_apply=True)
+            img_array = np.array(pil_img)
+            img_array = aug(image=img_array)['image']
+            pil_img = Image.fromarray(img_array)
+        return pil_img
+
+    def __repr__(self):
+        return self.__class__.__name__ + f'(p={self.p}, clip_limit={self.clip_limit}, tile_grid_size={self.tile_grid_size})'
+
+# class ToGray:
+#     def __init__(self, p=0.5):
+#         self.p = p
+
+#     def __call__(self, pil_img):
+
+#         if random.random() < self.p:
+#             pil_img = pil_img.convert('L')
+#         return pil_img
+
+#     def __repr__(self):
+#         return self.__class__.__name__ + f'(p={self.p})'
+
+class RandomCutout:
+    def __init__(self, p=0.1, max_holes=8, max_height=8, max_width=8):
+        self.p = p
+        self.max_holes = max_holes
+        self.max_height = max_height
+        self.max_width = max_width
+
+    def __call__(self, pil_img):
+        if random.random() < self.p:
+            aug = A.Cutout(num_holes=random.randint(1, self.max_holes), max_h_size=self.max_height, max_w_size=self.max_width, always_apply=True)
+            img_array = np.array(pil_img)
+            img_array = aug(image=img_array)['image']
+            pil_img = Image.fromarray(img_array)
+        return pil_img
+
+    def __repr__(self):
+        return self.__class__.__name__ + f'(p={self.p}, max_holes={self.max_holes}, max_height={self.max_height}, max_width={self.max_width})'
+    
+class RandomBlur:
+    def __init__(self, p=0.1, blur_limit=(3, 7)):
+        self.p = p
+        self.blur_limit = blur_limit
+
+    def __call__(self, pil_img):
+        if random.random() < self.p:
+            aug = A.Blur(blur_limit=self.blur_limit, always_apply=True)
+            img_array = np.array(pil_img)
+            img_array = aug(image=img_array)['image']
+            pil_img = Image.fromarray(img_array)
+        return pil_img
+    
+    def __repr__(self):
+        return self.__class__.__name__ + f'(p={self.p}, blur_limit={self.blur_limit})'
+
+class RandomMedianBlur:
+    def __init__(self, p=0.1, blur_limit=(3, 7)):
+        self.p = p
+        self.blur_limit = blur_limit
+
+    def __call__(self, pil_img):
+        if random.random() < self.p:
+            aug = A.MedianBlur(blur_limit=self.blur_limit, always_apply=True)
+            img_array = np.array(pil_img)
+            img_array = aug(image=img_array)['image']
+            pil_img = Image.fromarray(img_array)
+        return pil_img
+
+    def __repr__(self):
+        return self.__class__.__name__ + f'(p={self.p}, blur_limit={self.blur_limit})'
+ 
 class ToNumpy:
 
     def __call__(self, pil_img):
@@ -23,7 +105,6 @@ class ToNumpy:
             np_img = np.expand_dims(np_img, axis=-1)
         np_img = np.rollaxis(np_img, 2)  # HWC to CHW
         return np_img
-
 
 class ToTensor:
 
